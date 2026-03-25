@@ -1,0 +1,90 @@
+[内存管理]
+
+❓ MMAP是什么? 原理? 为什么MMAP比read/write快?
+- 是一种内存映射文件的机制, 将文件映射到虚拟地址空间, 使进程可以像内存一般读写文件, 不用频繁read/write系统调用 .
+❓ 传统read/write的缺点:
+- 涉及2次内存拷贝: 磁盘 -> 内核态(Page Cache) -> 用户态 (反之亦然), 涉及到多次用户态和内核态切换, 效率低.
+- MMAP的优点: mmap消除了page cache到用户空间的额外拷贝, 随机访存, 共享内存实现高性能IPC, 简化编程.
+- MMAP的缺点: 小文件mmap由于页表开销可能会更慢, 写是异步的, 需要msync刷盘.
+❓ MMAP的原理
+MMAP修改进程的页表, 使其与物理页对应上.
+❓ 第一次访问会发生什么? (可以使用MAP_POPULATE预热)
+首先、MMAP调用只是创建一个VMA结构体, 没有分配任何物理页，页表项也是空.
+接着、第一次访问会触发缺页中断, 切换到内核态执行缺页处理函数, 将磁盘文件加载进 Page Cache, 构建页表, 如果页缓存已存在直接复用, 构建页表映射, 然后返回用户态继续执行.
+总结：触发缺页中断, 分配物理内存, 更新页表, 从磁盘加载到 Page Cache.
+❓ 为什么对小文件效果差
+- mmap固定开销: 
+ - 创建VMA涉及内存分配, 锁, 搜索合适的虚拟地址空间; 
+ - 页表相关操作, 及时文件已经在 Page Cache 中仍然会走中断处理流程, 更新页表, 可能涉及 TLB 失效.
+ - munmap: 释放VMA, flush TLB, 处理脏页.
+- 频繁 mmap/munmap 会导致更多 TLB miss
+- page fault 比系统调用更重.
+❓ MMAP的副作用与限制:
+- 物理内存压力, 如果映射文件远大于物理内存, 频繁的随机访问会产生大量的缺页中断和页置换, 性能断崖下跌.
+- SIGBUS风险: mmap过程中, 另一进程截断该文件, 直接SIGBUS.
+❓ NUMA 架构内存分配不均对 mmap 性能影响.
+-> NUMA: CPU被划分多个节点, 每个节点有本地内存. 访问本地内存延迟低, 带宽高. 跨节点访问需要经过 QPI 延迟更高.
+-> 危害:
+    - 内存倾斜: 所有物理内存都分配在某个节点. -> 远程访问过多, 吞吐骤降.
+    - 远程缺页: 如果当前节点内存满了, 内核可能触发本地节点回收, 可能远程节点很闲, 严重性能抖动.
+-> 对策:
+    - numactl--interleave=all: 启动时, 强制内核将MMAP交错在CPU节点上.避免单点瓶颈.
+    - 绑定CPU亲和力, 尽量让处理数据的线程与它的访存在同节点.
+-> 工具:
+    - numastat -s 展示内核中关于NUMA内存分配统计, 本地节点命中, 被迫去远程节点分配.
+    - numastat -p <pid>: 查看内存倾斜.
+    - perf: node-loads, node-loads-misses, 本地和跨节点内存加载.
+    - perf mem 查看具体延迟和False Sharing.
+
+❓ HugePage
+    - 优点: 减少页表项和深度, 减少 TLB Miss. 
+    - 缺点: 内存碎片, 不可换出, 导致系统内存吃紧.
+
+📌Note: 别人问你MMAP的时候, 一方面关注MMAP减少拷贝开销, 一方面提到TLB减少TLB MISS, 同时提到NUMA亲和性的影响.
+
+⚖️ Diff: 小文件 vs MMAP
+- 小文件 read: 一次上下文切换, 可能有一次线程调度, 一次数据拷贝 (不需要构建页表)
+- MMAP: 第一次上下文切换, 并且构建VMA结构体, 第二次访问时会触发缺页中断, 有一次上下文切换, 可能会有线程调度, 构建页表, 锁竞争, 高并发多线程环境, 大量缺页中断会导致严重的锁竞争.
+
+⚖️ Diff: Direct IO vs MMAp
+-  MMAP策略交由内核, 不够透明.
+- Direct IO: 绕过 Page Cache, 应用自己管理 Buffer Pool, 可以更精准控制落盘时机和缓存淘汰策略.
+Direct IO完全不走 Page Cache, 用户缓冲区直接DMA到磁盘, 编程复杂(需要自己处理缓冲区对齐, IO大小对齐, 错误处理), 适合大文件顺序读写, 数据库引擎.
+
+❓ 零拷贝: 尽量减少CPU参与的数据拷贝, 同时减少用户态/内核态上下文切换次数
+- sendfile:
+    - 传统 read + write: 磁盘 (DMA)-> Page Cache (CPU)-> App (CPU)->  Socket Buffer (DMA) -> 网卡
+    - 优化: 磁盘 (DMA)-> Page Cache (引用) -> Socket Buffer (DMA) -> 网卡 
+    传统两次CPU拷贝+4次上下文切换, sendfile 0次CPU拷贝+2次上下文切换.
+- splice/tee
+    - 传统(Socket1->App->Socket2): Socket1 Buffer (CPU) -> App (CPU) -> Socket2 Buffer
+    - 优化: Socket1 Buffer (引用) -> pipe (引用) -> Socket2 Buffer
+    传统2次CPU拷贝+多次上下文切换, splice 0次拷贝+大幅减少上下文次数.
+- mmap
+    大幅减少系统调用, 并且减少了一次CPU拷贝.
+
+❓ False Sharing: 多线程修改位于同一 Cache Line 内的不同变量, 导致 Cache Line 不断失效, 触发 RFO 风暴.
+通过 alignas(64) 或手动填充使变量分布在不同 Cache Line.
+❓ 关于可见性问题
+略-之前已整理, 联动起来即可.
+
+❓ 关于伙伴系统和Slab分配器
+伙伴系统负责连续物理页分配和回收, 主要解决外部碎片; slab负责小块内存的快速分配, 主要解决内部碎片和小对象频繁分配和初始化开销.(分配时拆分, 释放时合并)
+Slab依赖伙伴系统, 当Slab需要更多内存时, 会从伙伴系统申请整页或多页, 然后切分成小对象管理.
+❓ 查看命令
+- 查看 Buddy 信息 cat /proc/buddyinfo -> 伙伴系统碎片
+- 查看 Slab 缓存 cat /proc/slabinfo 或 slabtop -> 内核对象占用, 以及内存泄漏
+- 内核配置 CONFIG_SLUB/CONFIG_SLAB/CONFIG_SLOB
+
+[系统I/O]
+
+❓ 普通 read 系统调用流程
+- 用户态调用 read()，执行 syscall 切换到内核态.
+- VFS 层 + 通用文件读路径
+- Page Cache 查找结果分支
+    a. Cache Hit: 直接拷贝数据到用户Buf
+    b. Cache Miss: 分配物理页, 调用文件系统读, 准备 bio 请求, 提交给磁盘驱动, 数据通过DMA加入 Page Cache. 唤醒读线程, 执行数据拷贝.
+- 返回用户态, 上下文切换
+
+📌Note: read 不走缺页中断, 防止流水线冲刷, 分支预测, TLB, 构建页表.
+📌Note: bio 用于文件系统层与磁盘驱动层解耦, 以及支持 Scatter-Gather IO, 支持 IO 调度和队列管理.
